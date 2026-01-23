@@ -1,2 +1,4 @@
 *.parquet
 *.DS_Store
+synthetic_exps/*
+!synthetic_exps/*.py
