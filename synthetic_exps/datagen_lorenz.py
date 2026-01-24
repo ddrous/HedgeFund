@@ -60,7 +60,7 @@ num_trajectories_train = 512
 num_trajectories_test = 128
 
 # Generate training and testing data
-train_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_train, num_trajectories_train, noise_std=0.5)
+train_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_train, num_trajectories_train, noise_std=0.25)
 test_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_test, num_trajectories_test, noise_std=0.0)
 # Save the data
 np.save('lorenz/train.npy', train_data)

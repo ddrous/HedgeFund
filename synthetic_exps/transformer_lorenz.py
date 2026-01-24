@@ -18,7 +18,7 @@ print(f"Train data shape: {train_data.shape}")  # (num_trajectories, num_timepoi
 print(f"Test data shape: {test_data.shape}")
 
 plt.plot(train_data[0], label='Sample 0')
-plt.plot(train_data[1], label='Sample 1')
+# plt.plot(train_data[1], label='Sample 1')
 plt.title("Time series in Lorenz dataset")
 plt.xlabel("Time step")
 plt.ylabel("Value")
@@ -26,20 +26,66 @@ plt.show()
 
 # %%
 ## Stanadrd normalisation of the data using training set stats
-train_mean = jnp.mean(train_data, axis=(0,1), keepdims=True)
-train_std = jnp.std(train_data, axis=(0,1), keepdims=True)
+train_mean = np.mean(train_data, axis=(0,1), keepdims=True)
+train_std = np.std(train_data, axis=(0,1), keepdims=True)
 
 train_data = (train_data - train_mean) / train_std
 test_data = (test_data - train_mean) / train_std
 
 ## Plot after normalization
 plt.plot(train_data[0], label='Sample 0')
-plt.plot(train_data[1], label='Sample 1')
+# plt.plot(train_data[1], label='Sample 1')
 # plt.legend()
 plt.title("Normalized time series in Lorenz dataset")
 plt.xlabel("Time step")
 plt.ylabel("Value")
 plt.show()
+
+
+# %%
+## Create a torch dataset and dataloader, with a custom collate function converting to JAX numpy arrays
+
+import torch
+from jax.tree_util import tree_map
+from torch.utils import data
+
+class LorenzDataset(data.Dataset):
+    def __init__(self, data):
+        self.data = torch.from_numpy(data).float()
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# def torch_to_jax_collate(batch):
+#     batch_np = np.stack(batch)
+#     # batch_jax = jnp.array(batch_np)
+#     return batch_np
+
+def numpy_collate(batch):
+  """Collate function to convert a batch of PyTorch data into NumPy arrays."""
+  return tree_map(np.asarray, data.default_collate(batch))
+
+num_epochs = 100
+print_every = 10
+batch_size = 2
+seed = 42
+
+train_dataset = LorenzDataset(train_data)
+train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=numpy_collate, num_workers=24)
+
+# train_loader = NumpyLoader(train_dataset, batch_size=32, shuffle=True, num_workers=24)
+
+# test_dataset = LorenzDataset(test_data)
+# test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=torch_to_jax_collate)
+
+## Test the dataloader 
+for batch in train_loader:
+    print("Batch shape:", batch.shape)  # Should be (batch_size, num_timepoints, state_dimension)
+    break
+
 
 # %%
 
@@ -184,140 +230,140 @@ class Transformer(eqx.Module):
         return final_traj
 
 
-# ## TODO: This is the new Transformer with micro-steps, like a Neural ODE. We repeatedly refine updates of the state
-# class Transformer(eqx.Module):
-#     embedding: eqx.nn.Linear
-#     pos_encoder: PositionalEncoding
-#     blocks: list
-#     norm_final: eqx.nn.LayerNorm
+## TODO: This is the new Transformer with micro-steps, like a Neural ODE. We repeatedly refine updates of the state
+class TransformerNODE(eqx.Module):
+    embedding: eqx.nn.Linear
+    pos_encoder: PositionalEncoding
+    blocks: list
+    norm_final: eqx.nn.LayerNorm
     
-#     # Replaces simple output_projection
-#     refinement_mlp: eqx.nn.MLP
+    # Replaces simple output_projection
+    refinement_mlp: eqx.nn.MLP
     
-#     d_model: int = eqx.field(static=True)
-#     n_layers: int = eqx.field(static=True)
-#     n_substeps: int = eqx.field(static=True)  # New Hyperparam
+    d_model: int = eqx.field(static=True)
+    n_layers: int = eqx.field(static=True)
+    n_substeps: int = eqx.field(static=True)  # New Hyperparam
     
-#     def __init__(self, input_dim, d_model, n_heads, n_layers, d_ff, max_len, n_substeps, key):
-#         self.d_model = d_model
-#         self.n_layers = n_layers
-#         self.n_substeps = n_substeps
+    def __init__(self, input_dim, d_model, n_heads, n_layers, d_ff, max_len, n_substeps, key):
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.n_substeps = n_substeps
         
-#         k_emb, k_refine = jax.random.split(key)
-#         k_layers = jax.random.split(key, n_layers)
+        k_emb, k_refine = jax.random.split(key)
+        k_layers = jax.random.split(key, n_layers)
         
-#         # 1. Embedding
-#         self.embedding = eqx.nn.Linear(input_dim, d_model, key=k_emb)
-#         self.pos_encoder = PositionalEncoding(d_model, max_len)
+        # 1. Embedding
+        self.embedding = eqx.nn.Linear(input_dim, d_model, key=k_emb)
+        self.pos_encoder = PositionalEncoding(d_model, max_len)
         
-#         # 2. Transformer Blocks
-#         self.blocks = [
-#             TransformerBlock(d_model, n_heads, d_ff, dropout=0.0, key=k)
-#             for k in k_layers
-#         ]
+        # 2. Transformer Blocks
+        self.blocks = [
+            TransformerBlock(d_model, n_heads, d_ff, dropout=0.0, key=k)
+            for k in k_layers
+        ]
         
-#         self.norm_final = eqx.nn.LayerNorm(d_model)
+        self.norm_final = eqx.nn.LayerNorm(d_model)
         
-#         # 3. Refinement MLP (The "Solver")
-#         # Input: d_model (Context) + d_model (Current Weight Embedding)
-#         # We perform a simple addition of context + state, so input size is d_model.
-#         self.refinement_mlp = eqx.nn.MLP(
-#             in_size=d_model*2,
-#             out_size=input_dim,
-#             width_size=d_model * 2, # Slightly wider hidden layer
-#             # width_size=(2*d_model + input_dim)//2, # Slightly wider hidden layer
-#             depth=1,                # 1 hidden layer is usually enough for local steps
-#             activation=jax.nn.gelu,
-#             key=k_refine
-#         )
+        # 3. Refinement MLP (The "Solver")
+        # Input: d_model (Context) + d_model (Current Weight Embedding)
+        # We perform a simple addition of context + state, so input size is d_model.
+        self.refinement_mlp = eqx.nn.MLP(
+            in_size=d_model*2,
+            out_size=input_dim,
+            width_size=d_model * 2, # Slightly wider hidden layer
+            # width_size=(2*d_model + input_dim)//2, # Slightly wider hidden layer
+            depth=1,                # 1 hidden layer is usually enough for local steps
+            activation=jax.nn.gelu,
+            key=k_refine
+        )
         
-#         # --- STABILITY FIX: Zero Init Last Layer of MLP ---
-#         # This ensures the refinement starts as "Identity" (delta=0)
-#         zeros_w = jnp.zeros_like(self.refinement_mlp.layers[-1].weight)
-#         zeros_b = jnp.zeros_like(self.refinement_mlp.layers[-1].bias)
-#         self.refinement_mlp = eqx.tree_at(
-#             lambda m: (m.layers[-1].weight, m.layers[-1].bias),
-#             self.refinement_mlp,
-#             (zeros_w, zeros_b)
-#         )
+        # --- STABILITY FIX: Zero Init Last Layer of MLP ---
+        # This ensures the refinement starts as "Identity" (delta=0)
+        zeros_w = jnp.zeros_like(self.refinement_mlp.layers[-1].weight)
+        zeros_b = jnp.zeros_like(self.refinement_mlp.layers[-1].bias)
+        self.refinement_mlp = eqx.tree_at(
+            lambda m: (m.layers[-1].weight, m.layers[-1].bias),
+            self.refinement_mlp,
+            (zeros_w, zeros_b)
+        )
 
-#     def make_causal_mask(self, seq_len):
-#         idx = jnp.arange(seq_len)
-#         mask = idx[:, None] >= idx[None, :]
-#         return mask
+    def make_causal_mask(self, seq_len):
+        idx = jnp.arange(seq_len)
+        mask = idx[:, None] >= idx[None, :]
+        return mask
 
-#     def make_onestep_mask(self, seq_len):
-#         """ Mask that allows each position to see only itself and the previous position"""
-#         idx = jnp.arange(seq_len)
-#         mask = (idx[:, None] - idx[None, :]) <= 1
-#         return mask
-#     def make_nsteps_mask(self, seq_len, n_steps):
-#         idx = jnp.arange(seq_len)
-#         mask = (idx[:, None] - idx[None, :]) <= n_steps
-#         return mask
+    def make_onestep_mask(self, seq_len):
+        """ Mask that allows each position to see only itself and the previous position"""
+        idx = jnp.arange(seq_len)
+        mask = (idx[:, None] - idx[None, :]) <= 1
+        return mask
+    def make_nsteps_mask(self, seq_len, n_steps):
+        idx = jnp.arange(seq_len)
+        mask = (idx[:, None] - idx[None, :]) <= n_steps
+        return mask
 
-#     def __call__(self, x0, steps, key=None):
-#         traj_buffer = jnp.zeros((steps, x0.shape[0]))
-#         traj_buffer = traj_buffer.at[0].set(x0)
-#         # full_mask = self.make_causal_mask(steps)
-#         # full_mask = self.make_onestep_mask(steps)
-#         full_mask = self.make_nsteps_mask(steps, n_steps=2)
-#         # full_mask = self.make_nsteps_mask(steps, n_steps=20)
-#         # full_mask = self.make_nsteps_mask(steps, n_steps=CONFIG["transformer_target_step"])
+    def __call__(self, x0, steps, key=None):
+        traj_buffer = jnp.zeros((steps, x0.shape[0]))
+        traj_buffer = traj_buffer.at[0].set(x0)
+        # full_mask = self.make_causal_mask(steps)
+        # full_mask = self.make_onestep_mask(steps)
+        full_mask = self.make_nsteps_mask(steps, n_steps=5)
+        # full_mask = self.make_nsteps_mask(steps, n_steps=20)
+        # full_mask = self.make_nsteps_mask(steps, n_steps=CONFIG["transformer_target_step"])
 
-#         def scan_step(carry, step_idx):
-#             current_traj = carry
+        def scan_step(carry, step_idx):
+            current_traj = carry
             
-#             # --- PHASE 1: MACRO STEP (Transformer) ---
-#             # Look at history x_0 ... x_t to decide "Global Direction"
+            # --- PHASE 1: MACRO STEP (Transformer) ---
+            # Look at history x_0 ... x_t to decide "Global Direction"
             
-#             # Embed & Scale
-#             x = jax.vmap(self.embedding)(current_traj) * jnp.sqrt(self.d_model)
-#             x = self.pos_encoder(x)
+            # Embed & Scale
+            x = jax.vmap(self.embedding)(current_traj) * jnp.sqrt(self.d_model)
+            x = self.pos_encoder(x)
             
-#             # Apply Blocks
-#             for block in self.blocks:
-#                 x = block(x, mask=full_mask)
-#             x = jax.vmap(self.norm_final)(x)
+            # Apply Blocks
+            for block in self.blocks:
+                x = block(x, mask=full_mask)
+            x = jax.vmap(self.norm_final)(x)
             
-#             # Get the "Context/Instruction" for the current step
-#             context_h = x[step_idx] # Shape (d_model,)
+            # Get the "Context/Instruction" for the current step
+            context_h = x[step_idx] # Shape (d_model,)
             
-#             # --- PHASE 2: MICRO STEPS (Iterative Refinement) ---
-#             # Evolve x_t -> x_t+1 using the context as a guide
+            # --- PHASE 2: MICRO STEPS (Iterative Refinement) ---
+            # Evolve x_t -> x_t+1 using the context as a guide
             
-#             start_weight = current_traj[step_idx]
+            start_weight = current_traj[step_idx]
             
-#             def refinement_loop(i, curr_weight):
-#                 # 1. Embed the intermediate weight to latent space
-#                 # We reuse the main embedding to share the "coordinate system"
-#                 w_emb = self.embedding(curr_weight) * jnp.sqrt(self.d_model)
+            def refinement_loop(i, curr_weight):
+                # 1. Embed the intermediate weight to latent space
+                # We reuse the main embedding to share the "coordinate system"
+                w_emb = self.embedding(curr_weight) * jnp.sqrt(self.d_model)
                 
-#                 # 2. Condition: Combine "Where we are" (w_emb) + "Where to go" (context_h)
-#                 # Adding them is a standard ResNet-like conditioning strategy
-#                 # combined_input = w_emb + context_h
-#                 combined_input = jnp.concatenate([w_emb, context_h])
+                # 2. Condition: Combine "Where we are" (w_emb) + "Where to go" (context_h)
+                # Adding them is a standard ResNet-like conditioning strategy
+                # combined_input = w_emb + context_h
+                combined_input = jnp.concatenate([w_emb, context_h])
                 
-#                 # 3. Predict Micro-Delta
-#                 micro_delta = self.refinement_mlp(combined_input)
+                # 3. Predict Micro-Delta
+                micro_delta = self.refinement_mlp(combined_input)
                 
-#                 # 4. Update
-#                 return curr_weight + micro_delta
+                # 4. Update
+                return curr_weight + micro_delta
 
-#             # Run the loop n_substeps times
-#             next_weight = jax.lax.fori_loop(0, self.n_substeps, refinement_loop, start_weight)
+            # Run the loop n_substeps times
+            next_weight = jax.lax.fori_loop(0, self.n_substeps, refinement_loop, start_weight)
             
-#             # --- WRITE BACK ---
-#             write_idx = jnp.minimum(step_idx + 1, steps - 1)
-#             new_traj = current_traj.at[write_idx].set(next_weight)
+            # --- WRITE BACK ---
+            write_idx = jnp.minimum(step_idx + 1, steps - 1)
+            new_traj = current_traj.at[write_idx].set(next_weight)
             
-#             # We return next_weight just for scan compliance, though we use new_traj
-#             return new_traj, next_weight
+            # We return next_weight just for scan compliance, though we use new_traj
+            return new_traj, next_weight
 
-#         step_indices = jnp.arange(steps)
-#         final_traj, _ = jax.lax.scan(scan_step, traj_buffer, step_indices)
+        step_indices = jnp.arange(steps)
+        final_traj, _ = jax.lax.scan(scan_step, traj_buffer, step_indices)
         
-#         return final_traj
+        return final_traj
 
 
 #%% Train the model, and predict and visualize
@@ -331,9 +377,19 @@ model = Transformer(
     n_layers=2,
     d_ff=128,
     max_len=128,
-    key=jax.random.PRNGKey(0)
+    key=jax.random.PRNGKey(seed)
 )
 
+# model = TransformerNODE(
+#     input_dim=3,
+#     d_model=32,
+#     n_heads=4,
+#     n_layers=2,
+#     d_ff=128,
+#     max_len=128,
+#     n_substeps=10,
+#     key=jax.random.PRNGKey(seed)
+# )
 
 # Test forward pass
 # x0 = pad_with_zeros(train_data[0], total_length=16)  # Shape (90, 1)
@@ -345,15 +401,24 @@ print("Predicted trajectory shape:", predicted_traj.shape)
 ## Now train the model to minimize MSE over the predicted trajectory
 
 ## Fully functional training loop
-optimizer = optax.adam(learning_rate=1e-3)
+optimizer = optax.adam(learning_rate=1e-4)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-def train_step(model, x0, true_traj, opt_state, key):
+@eqx.filter_jit
+def train_step(model, true_traj, opt_state, key):
     def loss_fn(model, x0, true_traj, key):
         pred_traj = eqx.filter_vmap(model, in_axes=(0, None, None))(x0, true_traj.shape[1], key)
         # pred_traj = model(x0, steps=true_traj.shape[0], key=key)
+
+        # ## Subsample a few time steps for loss computation to save memory
+        # time_indices = jax.random.choice(key, true_traj.shape[0], shape=(25,), replace=False)
+        # pred_traj_sub = pred_traj[time_indices]
+        # true_traj_sub = true_traj[time_indices]
+        # return jnp.mean((pred_traj_sub - true_traj_sub) ** 2)
+
         return jnp.mean((pred_traj - true_traj) ** 2)
-    
+
+    x0 = true_traj[:, 0]
     loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x0, true_traj, key)
     # model = optimizer.update(grads, model)
     updaes, opt_state = optimizer.update(grads, opt_state, model)
@@ -361,29 +426,39 @@ def train_step(model, x0, true_traj, opt_state, key):
     return model, opt_state, loss
 
 
-num_epochs = 100
-batch_size = 32
 losses = []
 
 for epoch in range(num_epochs):
     # Simple batching
-    perm = np.random.permutation(train_data.shape[0])
-    for i in range(0, train_data.shape[0], batch_size):
-        batch_indices = perm[i:i+batch_size]
-        batch_x0 = train_data[batch_indices, 0]  # Initial values
-        batch_true_traj = train_data[batch_indices]  # Full trajectories
-        
-        # for j in range(batch_size):
-        #     key, subkey = jax.random.split(jax.random.PRNGKey(epoch * batch_size + i + j))
-        #     model, opt_state, loss = train_step(model, batch_x0[j], batch_true_traj[j], opt_state, subkey)
-        #     losses.append(loss)
+    # perm = np.random.permutation(train_data.shape[0])
+    # for i in range(0, train_data.shape[0], batch_size):
+    #     batch_indices = perm[i:i+batch_size]
+    #     batch_x0 = train_data[batch_indices, 0]  # Initial values
+    #     batch_true_traj = train_data[batch_indices]  # Full trajectories
 
-        key, subkey = jax.random.split(jax.random.PRNGKey(epoch*batch_size + i))
-        model, opt_state, loss = train_step(model, batch_x0, batch_true_traj, opt_state, subkey)
+    #     ## Make sure the data is on GPU
+    #     batch_x0 = jax.device_put(batch_x0)
+    #     batch_true_traj = jax.device_put(batch_true_traj)
+
+    #     # for j in range(batch_size):
+    #     #     key, subkey = jax.random.split(jax.random.PRNGKey(epoch * batch_size + i + j))
+    #     #     model, opt_state, loss = train_step(model, batch_x0[j], batch_true_traj[j], opt_state, subkey)
+    #     #     losses.append(loss)
+
+    #     key, subkey = jax.random.split(jax.random.PRNGKey(epoch*batch_size + i))
+    #     model, opt_state, loss = train_step(model, batch_x0, batch_true_traj, opt_state, subkey)
+    #     losses.append(loss)
+
+    key = jax.random.PRNGKey(epoch)
+    for batch in train_loader:
+        batch = jax.device_put(batch)  # Move batch to device
+
+        key, subkey = jax.random.split(key)
+        model, opt_state, loss = train_step(model, batch, opt_state, subkey)
         losses.append(loss)
 
-    if epoch % 50 == 0:
-        print(f"Epoch {epoch}, Loss: {loss:.6f}")
+    if (epoch+1) % print_every == 0:
+        print(f"Epoch {epoch+1}, Loss: {loss:.6f}")
 
 #%%
 # Plot training loss
@@ -398,7 +473,7 @@ plt.show()
 
 #%%
 # Visualize test set predictions after training
-for i in range(5):
+for i in range(1):
     x0_test = test_data[i, 0]  # Initial value
     true_traj = test_data[i]   # True trajectory
     
@@ -414,3 +489,26 @@ for i in range(5):
     plt.ylabel("Value")
     plt.legend()
     plt.show()
+
+
+#%% Plot a 3D trajectory
+from mpl_toolkits.mplot3d import Axes3D
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+for i in range(1):
+    x0_test = test_data[i, 0]  # Initial value
+    true_traj = test_data[i]   # True trajectory
+    
+    pred_traj = model(x0_test, steps=true_traj.shape[0], key=jax.random.PRNGKey(42))
+    
+    ax.plot(true_traj[:, 0], true_traj[:, 1], true_traj[:, 2], label=f"True Traj {i}", color=f"C{i+8}", linewidth=2)
+    ax.plot(pred_traj[:, 0], pred_traj[:, 1], pred_traj[:, 2], label=f"Pred Traj {i}", color=f"C{i+8}", linewidth=4, linestyle='--', alpha=0.7)
+
+ax.set_title("3D Trajectory Prediction on Test Set")
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_zlabel("Z")
+ax.legend()
+plt.show()
+
+# %%
