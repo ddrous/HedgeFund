@@ -21,9 +21,10 @@ def generate_ode_data(ode_func, theta, x0, t_span, num_trajectories, noise_std=0
     from scipy.integrate import solve_ivp
 
     # t_eval = np.linspace(t_span[0], t_span[1], num=500)
-    t_eval = np.arange(t_span[0], t_span[1], 0.08)
+    t_eval = np.arange(t_span[0], t_span[1], 0.02)
 
     data = []
+    x0_orig = np.array(x0)
 
     for _ in range(num_trajectories):
         sol = solve_ivp(ode_func, t_span, x0, args=(theta,), t_eval=t_eval)
@@ -33,7 +34,7 @@ def generate_ode_data(ode_func, theta, x0, t_span, num_trajectories, noise_std=0
         data.append(noisy_trajectory)
 
         ## Change the initial condition slightly for the next trajectory
-        x0 = x0 + np.random.normal(0, 0.5, size=len(x0))
+        x0 = x0 + np.random.normal(0, 0.8, size=len(x0))
 
     return np.array(data)  # Shape (num_trajectories, num_timepoints, state_dimension)
 
@@ -54,13 +55,13 @@ def lorenz_system(t, x, theta):
 # Parameters for Lorenz system
 theta_lorenz = (10.0, 28.0, 8/3)
 x0_lorenz = [1.0, 1.0, 1.0]
-t_span_train = (0, 5)
-t_span_test = (0, 10)
-num_trajectories_train = 512
-num_trajectories_test = 128
+t_span_train = (0, 10)
+t_span_test = (0, 15)
+num_trajectories_train = 5000
+num_trajectories_test = 100
 
 # Generate training and testing data
-train_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_train, num_trajectories_train, noise_std=0.25)
+train_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_train, num_trajectories_train, noise_std=0.1)
 test_data = generate_ode_data(lorenz_system, theta_lorenz, x0_lorenz, t_span_test, num_trajectories_test, noise_std=0.0)
 # Save the data
 np.save('lorenz/train.npy', train_data)
