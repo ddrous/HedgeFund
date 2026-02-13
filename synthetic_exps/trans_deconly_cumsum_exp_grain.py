@@ -3,14 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import jax
-
 # jax.config.update("jax_debug_nans", True)
-## Disable JIT as well
+# ## Disable JIT as well
 # jax.config.update("jax_disable_jit", True)
-
-## Diable python warnings
-import warnings
-warnings.filterwarnings("ignore")
 
 import jax.numpy as jnp
 import equinox as eqx
@@ -25,21 +20,22 @@ import grain.python as grain
 jax.print_environment_info()
 
 ## JAX debug NaNs
-
+import multiprocessing
+multiprocessing.set_start_method('fork', force=True)
 
 # --- Configuration ---
 CONFIG = {
     "seed": 2028,
-    "n_epochs": 500,
-    "print_every": 100,
-    "num_seqs": 1024*4,
-    "batch_size": 1024,
+    "n_epochs": 100,
+    "print_every": 10,
+    "num_seqs": 64*4,
+    "batch_size": 64,
     "seq_len": 16,
     "seq_dim": 2,
     "cum_sum": False,
     "ar_train_mode": False,
     "n_refine_steps": 10,
-    "d_model": 128*2,
+    "d_model": 128*1,
     "lr": 3e-4
 }
 
@@ -116,6 +112,10 @@ def process_sample(sample):
     # Input: mask the last value of the target column
     x = sample.copy()
     x[-1, -1] = 0.0              # zero out the final target
+
+   # Convert to JAX arrays and place on GPU
+    x = jax.device_put(jnp.array(x))
+    y = jax.device_put(jnp.array(y))
 
     return {"x": x, "y": y}
 
@@ -247,7 +247,7 @@ models = {
         d_model=CONFIG["d_model"], 
         n_heads=1, 
         n_layers=1, 
-        d_ff=128*10,
+        d_ff=128,
         n_substeps=CONFIG["n_refine_steps"], 
         max_len=CONFIG["seq_len"], 
         use_refinement=False, 
@@ -258,7 +258,6 @@ models = {
 # Train Step
 # @eqx.filter_jit
 def train_step(model, optimizer, opt_state, batch, key):
-    batch = jax.device_put(batch)
     Xs, Ys = batch["x"], batch["y"]
     
     def loss_fn(m, x, y, k):
@@ -277,39 +276,50 @@ def train_step(model, optimizer, opt_state, batch, key):
 
     return model, opt_state, loss_val
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-
-def numpy_collate(batch):
-    """Collate function to convert PyTorch tensors to numpy/JAX arrays"""
-    if isinstance(batch[0], dict):
-        return {key: np.stack([b[key] for b in batch]) for key in batch[0]}
-    return np.stack(batch)
 
 def train(models, train_data, key):
 
     # Create a data source (no batching/shuffling here)
-    class ICLRegressionDataset(Dataset):
+    class SimpleDataSource(grain.RandomAccessDataSource):
         def __init__(self, data):
-            self._data = data.astype(np.float32)        
+            self._data = data        
         def __len__(self):
             return len(self._data)
         def __getitem__(self, index):
             return process_sample(self._data[index])
 
-    train_dataset = ICLRegressionDataset(train_data)
-    # Create PyTorch DataLoader
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=CONFIG["batch_size"],
+    data_source = SimpleDataSource(train_data)
+
+    # Sampler handles shuffling
+    sampler = grain.IndexSampler(
+        num_records=len(data_source),
         shuffle=True,
-        num_workers=24,  # Set to 0 to avoid multiprocessing issues, or 2-4 for speed
-        collate_fn=numpy_collate,
-        drop_last=False,
+        seed=CONFIG["seed"],
+        shard_options=grain.NoSharding(),
+        num_epochs=1,
     )
 
-    batch = next(iter(train_loader))
-    print(f"Example X shape: {batch['x'].shape}, type: {batch['x'].dtype}")
+    # DataLoader handles batching
+    loader = grain.DataLoader(
+        data_source=data_source,
+        sampler=sampler,
+        operations=[
+            grain.Batch(batch_size=CONFIG["batch_size"], 
+                        drop_remainder=False),
+        ],
+        worker_count=0,
+    )
+
+    # 4. The JAX Bridge
+    def jax_device_loader(grain_loader):
+        """Simple generator to move batches to device."""
+        for batch in grain_loader:
+            yield jax.device_put(batch)
+
+    # 5. Usage; # Grab one batch to test
+    train_loader = jax_device_loader(loader)
+    batch = next(train_loader)
+    print(f"Example X shape: {batch['x'].shape}, Device: {batch['x'].devices()}")
 
     # Optimizers (One per model)
     optimizers = {name: optax.adamw(CONFIG["lr"]) for name in models}
@@ -327,10 +337,11 @@ def train(models, train_data, key):
         # for _ in range(train_loader.steps_per_epoch):
         #     batch, state, mask = iterate(state)
 
-        for batch in train_loader:
+        epoch_iterator = jax_device_loader(loader)  # Create a new iterator for each epoch
+
+        for batch in loader:
             key, subkey = jax.random.split(key)
             
-
             for name in models:
                 models[name], opt_states[name], loss = train_step(
                     models[name], optimizers[name], opt_states[name], batch, subkey
