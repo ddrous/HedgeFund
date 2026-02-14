@@ -29,8 +29,8 @@ jax.print_environment_info()
 # --- Configuration ---
 CONFIG = {
     "seed": 2026,
-    "n_epochs": 1000,
-    "print_every": 100,
+    "n_epochs": 2000,
+    "print_every": 200,
     "num_seqs": 1200,
     "batch_size": 128,
     "seq_len": 32,
@@ -39,7 +39,7 @@ CONFIG = {
     "ar_train_mode": False,
     "n_refine_steps": 10,
     "d_model": 128*1,
-    "lr": 3e-4
+    "lr": 3e-5
 }
 
 # Set seeds
@@ -121,111 +121,246 @@ def process_sample(sample):
 
 
 #%%
-# --- 2. Transformer Models (Decoder-Only) ---
-class PositionalEncoding(eqx.Module):
-    embedding: jax.Array
-    def __init__(self, d_model: int, max_len: int = 2000):
-        pe = jnp.zeros((max_len, d_model))
-        position = jnp.arange(0, max_len, dtype=jnp.float32)[:, jnp.newaxis]
-        div_term = jnp.exp(jnp.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = pe.at[:, 0::2].set(jnp.sin(position * div_term))
-        pe = pe.at[:, 1::2].set(jnp.cos(position * div_term))
-        self.embedding = pe
-    def __call__(self, x, start_idx=0):
-        return x + self.embedding[start_idx : start_idx + x.shape[0], :]
- 
-class TransformerBlock(eqx.Module):
-    attention: eqx.nn.MultiheadAttention
-    norm1: eqx.nn.LayerNorm
+# --- 2. S4 Model (State Space Sequence Model) ---
+
+class S4Kernel(eqx.Module):
+    """
+    A minimal implementation of the S4D (Diagonal) kernel.
+    Computes the convolution kernel K based on diagonal state matrix A.
+    """
+    log_dt: jax.Array
+    A_real: jax.Array
+    A_imag: jax.Array
+    C: jax.Array
+    
+    def __init__(self, d_model, d_state, key):
+        k_dt, k_A, k_C = jax.random.split(key, 3)
+        
+        # 1. Initialize dt (step size) - standard random log initialization
+        # Drawn from U[0.001, 0.1] in log space
+        log_dt_min, log_dt_max = math.log(0.001), math.log(0.1)
+        self.log_dt = jax.random.uniform(k_dt, (d_model,), minval=log_dt_min, maxval=log_dt_max)
+        
+        # 2. Initialize A (Diagonal State Matrix)
+        # Using HiPPO-LegS approximation for diagonal A: Real part -0.5, Imag part Fourier-like
+        # A = -0.5 + i * n * pi
+        self.A_real = -0.5 * jnp.ones((d_model, d_state))
+        self.A_imag = jnp.repeat(jnp.arange(d_state)[None, :], d_model, axis=0) * math.pi
+        
+        # 3. Initialize C (Output projection)
+        # Standard complex normal initialization
+        self.C = jax.random.normal(k_C, (d_model, d_state, 2)) * 0.5 # stored as (real, imag)
+    
+    def __call__(self, L):
+        """ Computes the convolution kernel of length L """
+        # Materialize parameters
+        dt = jnp.exp(self.log_dt)[:, None] # (H, 1)
+        A = jax.lax.complex(self.A_real, self.A_imag) # (H, N)
+        C = jax.lax.complex(self.C[..., 0], self.C[..., 1]) # (H, N)
+        
+        # Discretize A using Bilinear (Tustin) transform
+        # A_bar = (I + dt*A/2) / (I - dt*A/2)  <-- Simplified diagonal update
+        # However, for the kernel computation in frequency domain, we use the continuous form:
+        # K_bar(z) = C (I - A_bar z^-1)^-1 B_bar
+        # The closed form computation for S4D kernel over L steps:
+        
+        # 1. Compute Power of A terms (Vandermonde generator)
+        # We need the roots of unity for the FFT
+        omega = jnp.exp(-2j * jnp.pi * jnp.arange(L) / L) # (L,)
+        
+        # The transfer function at frequencies omega: H(z) = 2 * dt * C * (1 - Omega)^-1 ...
+        # A more stable approach for S4D is computing the kernel via the Cauchy structure directly
+        # K = 2 * dt * C * ( (1+omega) - (1-omega) A dt / 2 )^-1
+        
+        # Vectorized computation broadcasted over H (channels) and N (state)
+        # z = (1 + omega) / (1 - omega) * (2 / dt)  <-- Bilinear mapping to continuous domain
+        
+        # Standard S4D Kernel (Frequency Domain):
+        # K[k] = \sum_n ( C_n * 2*dt / (1 - A_n * dt * (1+omega)/(1-omega)) ) * ...
+        # Let's use the explicit "Cauchy" calculation which is numerically safe
+        
+        z = jnp.exp(2j * jnp.pi * jnp.arange(L) / L) # Roots of unity
+        
+        # Bilinear transform of z back to continuous s-plane
+        # s = 2/dt * (z-1)/(z+1)
+        # But we can just compute the term: 2*dt / ( (1-z) - A*dt*(1+z)/2 ) * ...
+        # Simplified: K_bar = 2 * dt * C / ( 1 - A_bar * z_inv ) is for recurrence.
+        
+        # Using the standard minimal kernel formula for S4D:
+        # K_hat = 2 * C * (1 - A)^-1 B (approx)
+        # Exact discrete time kernel for Diagonal A:
+        # k = C * A_bar^t * B_bar
+        
+        # We compute this efficiently in frequency domain:
+        # K_f = 2 * dt * C / ( (1 - A_real*dt) - z * (1 + A_real*dt) - i*(...) )
+        # Let's do the rigorous calculation:
+        
+        dt_A = A * dt  # (H, N)
+        
+        # Denominator for bilinear transform
+        # We want to evaluate at z = exp(i 2pi k / L)
+        # Term = (2/dt) * (1-zinv)/(1+zinv) - A
+        # Reshaped for broadcasting:
+        # (1-z^-1)/(1+z^-1) = i * tan(pi k / L) ... or just compute raw
+        
+        z_inv = jnp.exp(-2j * jnp.pi * jnp.arange(L) / L) # (L,)
+        
+        # This term maps z-domain to s-domain
+        # s = 2/dt * (1 - z^-1) / (1 + z^-1)
+        # Denom = s - A
+        
+        # Trick to avoid division by zero at k=0 if A is purely imaginary (it's not, real part is -0.5)
+        # H (batch), N (state), L (seq)
+        
+        # Expand dims
+        z_inv = z_inv[None, None, :] # (1, 1, L)
+        dt_exp = dt[:, :, None]      # (H, 1, 1)
+        A_exp = A[:, :, None]        # (H, N, 1)
+        
+        # Bilinear transform s-vals
+        # Handle the singularity at z=-1 (Nyquist) by using a small epsilon or logic, 
+        # but standard complex float usually handles it okay-ish or we assume L is even.
+        
+        # A simpler way often used in S4D codebases:
+        # K_hat = 2 * dt * C / ( 1 + dt*A - z_inv * (1 - dt*A) ) * B
+        # Assume B = 1 for S4D (absorbed into C)
+        
+        denom = (1 - z_inv) - A_exp * (dt_exp / 2.0) * (1 + z_inv)
+        # Actually standard bilinear discretization:
+        # A_bar = (1 + A dt/2) / (1 - A dt/2)
+        # B_bar = dt / (1 - A dt/2) * B
+        # Transfer func H(z) = C (I - A_bar z^-1)^-1 B_bar
+        
+        # We calculate H(z) directly.
+        # H(z) = C * B_bar / (1 - A_bar z^-1)
+        
+        A_bar = (1 + dt_A/2) / (1 - dt_A/2) # (H, N)
+        B_bar = dt / (1 - dt_A/2)           # (H, N) assuming B=ones
+        
+        # H(z) = \sum C_n * B_bar_n / (1 - A_bar_n z^-1)
+        # This is a sum of simple poles.
+        
+        C_exp = C[:, :, None]          # (H, N, 1)
+        B_bar_exp = B_bar[:, :, None]  # (H, N, 1)
+        A_bar_exp = A_bar[:, :, None]  # (H, N, 1)
+        
+        # Sum over state dimension N
+        # Result shape (H, L)
+        H_z = jnp.sum( C_exp * B_bar_exp / (1 - A_bar_exp * z_inv), axis=1 )
+        
+        return H_z # Frequency response
+
+class S4Block(eqx.Module):
+    layer_norm: eqx.nn.LayerNorm
+    s4_kernel: S4Kernel
+    out_proj: eqx.nn.Linear
+    skip_proj: eqx.nn.Linear
+    
     mlp: eqx.nn.MLP
     norm2: eqx.nn.LayerNorm
     
-    def __init__(self, d_model, n_heads, d_ff, dropout, key):
-        k1, k2 = jax.random.split(key)
-        self.attention = eqx.nn.MultiheadAttention(
-            num_heads=n_heads, query_size=d_model, dropout_p=dropout, key=k1
-        )
-        self.norm1 = eqx.nn.LayerNorm(d_model)
-        self.mlp = eqx.nn.MLP(
-            in_size=d_model, out_size=d_model, width_size=d_ff, depth=1, activation=jax.nn.gelu, key=k2
-        )
+    d_model: int = eqx.field(static=True)
+    
+    def __init__(self, d_model, d_state, dropout, key):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.d_model = d_model
+        
+        self.layer_norm = eqx.nn.LayerNorm(d_model)
+        self.s4_kernel = S4Kernel(d_model, d_state, k1)
+        
+        # O = S4(x)
+        self.out_proj = eqx.nn.Linear(d_model, d_model, key=k2)
+        self.skip_proj = eqx.nn.Linear(d_model, d_model, key=k3) # D connection
+        
         self.norm2 = eqx.nn.LayerNorm(d_model)
+        self.mlp = eqx.nn.MLP(
+            in_size=d_model, out_size=d_model, width_size=d_model*4, depth=1, activation=jax.nn.gelu, key=k4
+        )
 
-    def __call__(self, x, mask=None, key=None):
-        attn_out = self.attention(x, x, x, mask=mask, key=key)
-        x = jax.vmap(self.norm1)(x + attn_out)
-        mlp_out = jax.vmap(self.mlp)(x)
-        x = jax.vmap(self.norm2)(x + mlp_out)
+    def __call__(self, x, key=None):
+        # x: (L, H)
+        L, H = x.shape
+        
+        shortcut = x
+        x = jax.vmap(self.layer_norm)(x)
+        
+        # 1. S4 Convolution
+        # Compute Kernel in freq domain
+        K_f = self.s4_kernel(L) # (H, L)
+        
+        # FFT of input
+        U_f = jnp.fft.rfft(x, axis=0) # (L//2+1, H)
+        
+        # We need to handle the FFT lengths matching
+        # K_f is full length L, U_f is rfft length
+        # Typically we use full FFT for convolution or adapt K
+        # Let's use full FFT to be safe and clear
+        U_f_full = jnp.fft.fft(x, axis=0) # (L, H)
+        
+        # Convolution y = k * u  <=> Y = K * U
+        Y_f = K_f.T * U_f_full # (L, H) * (L, H) elementwise
+        
+        y = jnp.fft.ifft(Y_f, axis=0).real # (L, H)
+        
+        # 2. Skip (D) connection
+        # Standard S4 has y = S4(x) + D*x
+        # We model D as a linear mixing for simplicity or elementwise parameter
+        y = y + jax.vmap(self.skip_proj)(x)
+        
+        # 3. Output projection + GLU (often used in S4, here simple Linear+GELU for compat)
+        y = jax.nn.gelu(y)
+        y = jax.vmap(self.out_proj)(y)
+        
+        # Residual
+        x = shortcut + y
+        
+        # MLP Block
+        shortcut = x
+        x = jax.vmap(self.norm2)(x)
+        x = jax.vmap(self.mlp)(x)
+        x = shortcut + x
+        
         return x
 
-class DecoderOnlyTransformer(eqx.Module):
+class S4Model(eqx.Module):
     embedding: eqx.nn.Linear
-    pos_encoder: PositionalEncoding
     blocks: list
     output_projection: eqx.nn.Linear
-    refinement_mlp: eqx.nn.MLP
 
     d_model: int = eqx.field(static=True)
-    n_substeps: int = eqx.field(static=True)
-    use_refinement: bool = eqx.field(static=True)
 
-    def __init__(self, input_dim, d_model, n_heads, n_layers, d_ff, n_substeps, max_len, use_refinement, key):
+    def __init__(self, input_dim, d_model, n_layers, d_state, key):
         self.d_model = d_model
-        self.n_substeps = n_substeps
-        self.use_refinement = use_refinement
         
         keys = jax.random.split(key, 5)
         self.embedding = eqx.nn.Linear(input_dim, d_model, key=keys[0])
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_len)
+        
+        # S4 generally doesn't need Positional Embeddings!
         
         self.blocks = [
-            TransformerBlock(d_model, n_heads, d_ff, dropout=0.0, key=k)
+            S4Block(d_model, d_state, dropout=0.0, key=k)
             for k in jax.random.split(keys[1], n_layers)
         ]
         
         self.output_projection = eqx.nn.Linear(d_model, 1, key=keys[2])
-        # Zero Init Output
+        # Zero Init Output for stability
         self.output_projection = eqx.tree_at(
             lambda l: (l.weight, l.bias), 
             self.output_projection, 
             (jnp.zeros_like(self.output_projection.weight), jnp.zeros_like(self.output_projection.bias))
         )
 
-        self.refinement_mlp = eqx.nn.MLP(
-            in_size=d_model * 2, out_size=input_dim, width_size=d_ff, depth=1, activation=jax.nn.gelu, key=keys[3]
-        )
-        # Zero Init Refinement
-        self.refinement_mlp = eqx.tree_at(
-            lambda m: (m.layers[-1].weight, m.layers[-1].bias),
-            self.refinement_mlp,
-            (jnp.zeros_like(self.refinement_mlp.layers[-1].weight), jnp.zeros_like(self.refinement_mlp.layers[-1].bias))
-        )
-
-    def make_causal_mask(self, seq_len):
-        idx = jnp.arange(seq_len)
-        return idx[:, None] < idx[None, :]
-
-    def refine_step(self, start_val, context_h):
-        def loop_fn(i, curr_val):
-            w_emb = self.embedding(curr_val) * jnp.sqrt(self.d_model)
-            combined = jnp.concatenate([w_emb, context_h])
-            delta = self.refinement_mlp(combined)
-            return curr_val + delta
-        return jax.lax.fori_loop(0, self.n_substeps, loop_fn, start_val)
-
     def __call__(self, input_seqs, key=None):
         def single_forward(input_seq, key):
-            x = jax.vmap(self.embedding)(input_seq) * jnp.sqrt(self.d_model)
-            x = self.pos_encoder(x)
-            mask = self.make_causal_mask(x.shape[0])
-            for block in self.blocks:
-                x = block(x, mask=mask, key=key)
+            # Input (L, dim)
+            x = jax.vmap(self.embedding)(input_seq)
             
-            if not self.use_refinement:
-                y = jax.vmap(self.output_projection)(x)
-            else:
-                y = jax.vmap(self.refine_step)(input_seq, x)
-
+            # S4 Blocks
+            for block in self.blocks:
+                x = block(x, key=key)
+            
+            # Output Head
+            y = jax.vmap(self.output_projection)(x)
             return y
         
         keys = jax.random.split(key, input_seqs.shape[0])
@@ -236,8 +371,7 @@ class DecoderOnlyTransformer(eqx.Module):
         output_seq = self(input_seq, key)
 
         if CONFIG["cum_sum"]:
-            ## Output_seq is a cum sum, we need to convert it back to normal values
-            diff_seq =output_seq[:, 1:, :] - output_seq[:, :-1, :]
+            diff_seq = output_seq[:, 1:, :] - output_seq[:, :-1, :]
             first_val = output_seq[:, :1, :]
             return jnp.concatenate([first_val, diff_seq], axis=1)
         else:
@@ -248,19 +382,15 @@ class DecoderOnlyTransformer(eqx.Module):
 # --- 4. Training Setup & Comparison ---
 
 # Initialize Models
-key, k1, k2, k3 = jax.random.split(key, 4)
+key, k1 = jax.random.split(key, 2)
 
-max_seq_len = max(train_data.shape[1], test_data.shape[1])
+# Replacing Transformer with S4
 models = {
-    "Transformer": DecoderOnlyTransformer(
+    "S4": S4Model(
         input_dim=CONFIG["seq_dim"], 
         d_model=CONFIG["d_model"], 
-        n_heads=1, 
-        n_layers=1, 
-        d_ff=128*10,
-        n_substeps=CONFIG["n_refine_steps"], 
-        max_len=CONFIG["seq_len"], 
-        use_refinement=False, 
+        n_layers=2,           # S4 is deep usually, but 2 layers is fine here
+        d_state=64,           # State dimension for the ODE
         key=k1
     )
 }
@@ -271,7 +401,7 @@ def train_step(model, optimizer, opt_state, batch, key):
     Xs, Ys = batch["x"], batch["y"]
     
     def loss_fn(m, x, y, k):
-        # Transformer
+        # Model forward
         y_hat = m(x, key=k)
 
         indices = jnp.arange(x.shape[1])
@@ -312,7 +442,7 @@ def train(models, train_data, key):
         train_dataset,
         batch_size=CONFIG["batch_size"],
         shuffle=True,
-        num_workers=24,  # Set to 0 to avoid multiprocessing issues, or 2-4 for speed
+        num_workers=0, # JAX/Torch multiprocessing conflict avoidance
         collate_fn=numpy_collate,
         drop_last=False,
     )

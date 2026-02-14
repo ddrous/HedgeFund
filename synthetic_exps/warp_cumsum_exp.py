@@ -19,6 +19,7 @@ import optax
 # from torch.utils import data
 import math
 import time
+from jax.flatten_util import ravel_pytree
 
 ## Print JAX info
 jax.print_environment_info()
@@ -39,7 +40,7 @@ CONFIG = {
     "ar_train_mode": False,
     "n_refine_steps": 10,
     "d_model": 128*1,
-    "lr": 3e-4
+    "lr": 3e-5
 }
 
 # Set seeds
@@ -121,125 +122,167 @@ def process_sample(sample):
 
 
 #%%
-# --- 2. Transformer Models (Decoder-Only) ---
-class PositionalEncoding(eqx.Module):
-    embedding: jax.Array
-    def __init__(self, d_model: int, max_len: int = 2000):
-        pe = jnp.zeros((max_len, d_model))
-        position = jnp.arange(0, max_len, dtype=jnp.float32)[:, jnp.newaxis]
-        div_term = jnp.exp(jnp.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = pe.at[:, 0::2].set(jnp.sin(position * div_term))
-        pe = pe.at[:, 1::2].set(jnp.cos(position * div_term))
-        self.embedding = pe
-    def __call__(self, x, start_idx=0):
-        return x + self.embedding[start_idx : start_idx + x.shape[0], :]
- 
-class TransformerBlock(eqx.Module):
-    attention: eqx.nn.MultiheadAttention
-    norm1: eqx.nn.LayerNorm
-    mlp: eqx.nn.MLP
-    norm2: eqx.nn.LayerNorm
-    
-    def __init__(self, d_model, n_heads, d_ff, dropout, key):
-        k1, k2 = jax.random.split(key)
-        self.attention = eqx.nn.MultiheadAttention(
-            num_heads=n_heads, query_size=d_model, dropout_p=dropout, key=k1
-        )
-        self.norm1 = eqx.nn.LayerNorm(d_model)
-        self.mlp = eqx.nn.MLP(
-            in_size=d_model, out_size=d_model, width_size=d_ff, depth=1, activation=jax.nn.gelu, key=k2
-        )
-        self.norm2 = eqx.nn.LayerNorm(d_model)
+# --- 2. WARP Model (Weight-space Adaptive Recurrent Prediction) ---
 
-    def __call__(self, x, mask=None, key=None):
-        attn_out = self.attention(x, x, x, mask=mask, key=key)
-        x = jax.vmap(self.norm1)(x + attn_out)
-        mlp_out = jax.vmap(self.mlp)(x)
-        x = jax.vmap(self.norm2)(x + mlp_out)
-        return x
+class RootMLP(eqx.Module):
+    """
+    The auxiliary 'root' network that gets updated at every time step.
+    It maps Input -> Scalar Output.
+    """
+    layers: list
 
-class DecoderOnlyTransformer(eqx.Module):
-    embedding: eqx.nn.Linear
-    pos_encoder: PositionalEncoding
-    blocks: list
-    output_projection: eqx.nn.Linear
-    refinement_mlp: eqx.nn.MLP
-
-    d_model: int = eqx.field(static=True)
-    n_substeps: int = eqx.field(static=True)
-    use_refinement: bool = eqx.field(static=True)
-
-    def __init__(self, input_dim, d_model, n_heads, n_layers, d_ff, n_substeps, max_len, use_refinement, key):
-        self.d_model = d_model
-        self.n_substeps = n_substeps
-        self.use_refinement = use_refinement
+    def __init__(self, in_size, out_size, width, depth, key):
+        keys = jax.random.split(key, depth + 1)
+        self.layers = []
         
-        keys = jax.random.split(key, 5)
-        self.embedding = eqx.nn.Linear(input_dim, d_model, key=keys[0])
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_len)
+        # Input layer
+        self.layers.append(eqx.nn.Linear(in_size, width, key=keys[0]))
         
-        self.blocks = [
-            TransformerBlock(d_model, n_heads, d_ff, dropout=0.0, key=k)
-            for k in jax.random.split(keys[1], n_layers)
-        ]
-        
-        self.output_projection = eqx.nn.Linear(d_model, 1, key=keys[2])
-        # Zero Init Output
-        self.output_projection = eqx.tree_at(
-            lambda l: (l.weight, l.bias), 
-            self.output_projection, 
-            (jnp.zeros_like(self.output_projection.weight), jnp.zeros_like(self.output_projection.bias))
-        )
-
-        self.refinement_mlp = eqx.nn.MLP(
-            in_size=d_model * 2, out_size=input_dim, width_size=d_ff, depth=1, activation=jax.nn.gelu, key=keys[3]
-        )
-        # Zero Init Refinement
-        self.refinement_mlp = eqx.tree_at(
-            lambda m: (m.layers[-1].weight, m.layers[-1].bias),
-            self.refinement_mlp,
-            (jnp.zeros_like(self.refinement_mlp.layers[-1].weight), jnp.zeros_like(self.refinement_mlp.layers[-1].bias))
-        )
-
-    def make_causal_mask(self, seq_len):
-        idx = jnp.arange(seq_len)
-        return idx[:, None] < idx[None, :]
-
-    def refine_step(self, start_val, context_h):
-        def loop_fn(i, curr_val):
-            w_emb = self.embedding(curr_val) * jnp.sqrt(self.d_model)
-            combined = jnp.concatenate([w_emb, context_h])
-            delta = self.refinement_mlp(combined)
-            return curr_val + delta
-        return jax.lax.fori_loop(0, self.n_substeps, loop_fn, start_val)
-
-    def __call__(self, input_seqs, key=None):
-        def single_forward(input_seq, key):
-            x = jax.vmap(self.embedding)(input_seq) * jnp.sqrt(self.d_model)
-            x = self.pos_encoder(x)
-            mask = self.make_causal_mask(x.shape[0])
-            for block in self.blocks:
-                x = block(x, mask=mask, key=key)
+        # Hidden layers
+        for i in range(depth - 1):
+            self.layers.append(eqx.nn.Linear(width, width, key=keys[i+1]))
             
-            if not self.use_refinement:
-                y = jax.vmap(self.output_projection)(x)
-            else:
-                y = jax.vmap(self.refine_step)(input_seq, x)
+        # Output layer
+        self.layers.append(eqx.nn.Linear(width, out_size, key=keys[-1]))
 
-            return y
+    def __call__(self, x):
+        for layer in self.layers[:-1]:
+            x = jax.nn.relu(layer(x))
+        return self.layers[-1](x)
+
+class WARP(eqx.Module):
+    # Learnable parameters for the weight-space recurrence
+    A: jax.Array  # State transition (Weights -> Weights)
+    B: jax.Array  # Input transition (Data -> Weights)
+    
+    # Hypernetwork to initialize theta_0
+    hypernet: eqx.nn.MLP
+    
+    # Static definition of the root network structure (to use for unraveling)
+    root_structure: RootMLP = eqx.field(static=True)
+    unravel_fn: callable = eqx.field(static=True)
+    
+    # Configuration
+    d_theta: int = eqx.field(static=True)
+    use_tau: bool = eqx.field(static=True)
+    seq_len: int = eqx.field(static=True)
+
+    def __init__(self, input_dim, seq_len, root_width, root_depth, use_tau, key):
+        k_root, k_hyper, k_A, k_B = jax.random.split(key, 4)
+        self.use_tau = use_tau
+        self.seq_len = seq_len
+
+        # 1. Define the Root Network Structure
+        # If use_tau is True, input dim increases by 1
+        root_input_dim = input_dim + 1 if use_tau else input_dim
         
-        keys = jax.random.split(key, input_seqs.shape[0])
-        return jax.vmap(single_forward)(input_seqs, keys)
+        # Initialize a template root network to get its parameter size and structure
+        template_root = RootMLP(root_input_dim, 1, root_width, root_depth, k_root)
+        
+        # Extract flat parameter vector size using JAX's flatten_util
+        flat_params, self.unravel_fn = ravel_pytree(template_root)
+        self.d_theta = flat_params.shape[0]
+        self.root_structure = template_root # Store for structure reference if needed
+        
+        print(f"WARP Initialized: Root Network has {self.d_theta} parameters (State Size).")
+
+        # 2. Initialize WARP Dynamics (A, B)
+        # A: Identity initialization (as per paper Section 2.2) to emulate gradient descent/residual flow
+        self.A = jnp.eye(self.d_theta)
+        
+        # B: Zero initialization (as per paper Section 2.2)
+        # Maps input difference (dim=input_dim) to weight space (dim=d_theta)
+        self.B = jnp.zeros((self.d_theta, input_dim))
+
+        # 3. Initialize Hypernetwork (phi)
+        # Maps initial input x_0 -> initial weights theta_0
+        # Paper suggests gradually increasing width, here using standard MLP for simplicity
+        self.hypernet = eqx.nn.MLP(
+            in_size=input_dim,
+            out_size=self.d_theta,
+            width_size=128,
+            depth=2,
+            activation=jax.nn.relu,
+            key=k_hyper
+        )
+
+    def __call__(self, input_seq, key=None):
+        """
+        input_seq: (Seq_Len, Input_Dim)
+        Returns: (Seq_Len, 1) - The predicted y values
+        """
+        
+        # 1. Precompute Input Differences (Delta x)
+        # Delta x_t = x_t - x_{t-1}
+        # For t=0, we can define Delta x_0 = 0 or learnable. 
+        # The paper uses a hypernet for theta_0 based on x_0, so recurrence starts effectively at t=1 updates.
+        
+        # Helper to get x_{t} and x_{t-1}. 
+        # We pad the beginning to compute diffs easily.
+        x_pad = jnp.concatenate([input_seq[:1], input_seq[:-1]], axis=0)
+        delta_x = input_seq - x_pad # Shape (L, D_x)
+        
+        # 2. Initialize Weight State theta_0
+        # theta_0 = phi(x_0)
+        theta_0 = self.hypernet(input_seq[0])
+        
+        # 3. Recurrence Scan: theta_t = A * theta_{t-1} + B * Delta x_t
+        def step(theta_prev, dx_t):
+            # Eq (1) from paper
+            theta_next = self.A @ theta_prev + self.B @ dx_t
+            return theta_next, theta_next
+
+        # Scan over sequence
+        _, theta_seq = jax.lax.scan(step, theta_0, delta_x)
+        
+        # Prepend theta_0 to align time steps (theta_seq contains theta_1 ... theta_T)
+        # If we strictly follow paper, theta_t is used to predict y_t.
+        # However, theta_0 is the state *before* seeing delta_x_1? 
+        # The paper says: theta_t = A theta_{t-1} + B Delta x_t. y_t = MLP_{theta_t}.
+        # This implies theta_0 is used for y_0, theta_1 (updated with dx1) used for y_1.
+        # But scan returns theta_1...theta_T. We need to construct the full sequence [theta_0, theta_1, ... theta_{T-1}].
+        
+        # Shift: The state used for time t is result of update at time t (current input diff).
+        # Actually, usually theta_0 is prepared from x_0, and immediately used to predict y_0?
+        # Let's assume the scan output theta_seq corresponds to indices 0..T-1 effectively if we treat the update as happening 'instantaneously' or if theta_0 is the starting state.
+        # Let's stick to: We have theta_0. The scan produces theta_1 to theta_{L}.
+        # We want outputs for 0 to L-1.
+        # So we use [theta_0, theta_1, ... theta_{L-1}].
+        
+        all_thetas = jnp.concatenate([theta_0[None, :], theta_seq[:-1]], axis=0)
+        
+        # 4. Decode (Apply Root Network)
+        # y_t = Root(x_t; weights=theta_t)
+        
+        # Generate normalized time tau if needed
+        L = input_seq.shape[0]
+        taus = jnp.linspace(0, 1, L)[:, None] # (L, 1)
+
+        def apply_root_at_t(theta, x, tau):
+            # Reconstruct the root network from the flat weight vector
+            root = self.unravel_fn(theta)
+            
+            # Prepare input
+            if self.use_tau:
+                root_in = jnp.concatenate([x, tau], axis=-1)
+            else:
+                root_in = x
+                
+            return root(root_in)
+
+        # Vectorize the application of the root network over the sequence
+        ys = jax.vmap(apply_root_at_t)(all_thetas, input_seq, taus)
+        
+        return ys
 
     def predict(self, input_seq, key=None):
         """ Predict and remove the cumsum on the prediction if needed """
         output_seq = self(input_seq, key)
 
         if CONFIG["cum_sum"]:
-            ## Output_seq is a cum sum, we need to convert it back to normal values
-            diff_seq =output_seq[:, 1:, :] - output_seq[:, :-1, :]
-            first_val = output_seq[:, :1, :]
-            return jnp.concatenate([first_val, diff_seq], axis=1)
+            diff_seq = output_seq[1:, :] - output_seq[:-1, :]
+            first_val = output_seq[:1, :]
+            return jnp.concatenate([first_val, diff_seq], axis=0)
         else:
             return output_seq
 
@@ -248,19 +291,19 @@ class DecoderOnlyTransformer(eqx.Module):
 # --- 4. Training Setup & Comparison ---
 
 # Initialize Models
-key, k1, k2, k3 = jax.random.split(key, 4)
+key, k1 = jax.random.split(key, 2)
 
-max_seq_len = max(train_data.shape[1], test_data.shape[1])
+# Replacing S4 with WARP
+# Note: Root width/depth controls d_theta. 
+# Width 16, Depth 1 -> ~50-100 params. Matrix A ~ 10k params. Very fast.
+# Width 32, Depth 2 -> ~1000 params. Matrix A ~ 1M params. Slower but more expressive.
 models = {
-    "Transformer": DecoderOnlyTransformer(
+    "WARP": WARP(
         input_dim=CONFIG["seq_dim"], 
-        d_model=CONFIG["d_model"], 
-        n_heads=1, 
-        n_layers=1, 
-        d_ff=128*10,
-        n_substeps=CONFIG["n_refine_steps"], 
-        max_len=CONFIG["seq_len"], 
-        use_refinement=False, 
+        seq_len=CONFIG["seq_len"],
+        root_width=16,       # Keep small for efficiency in this demo
+        root_depth=2,        # Depth of the meta-learned network
+        use_tau=False,        # Optional flag as requested
         key=k1
     )
 }
@@ -271,8 +314,10 @@ def train_step(model, optimizer, opt_state, batch, key):
     Xs, Ys = batch["x"], batch["y"]
     
     def loss_fn(m, x, y, k):
-        # Transformer
-        y_hat = m(x, key=k)
+        # Model forward
+        # WARP expects (Batch, Seq, Dim) -> vmap over batch
+        # y_hat = jax.vmap(m)(x, key=k)
+        y_hat = jax.vmap(m, in_axes=(0))(x)
 
         indices = jnp.arange(x.shape[1])
         # indices = jnp.array([-1])
@@ -312,7 +357,7 @@ def train(models, train_data, key):
         train_dataset,
         batch_size=CONFIG["batch_size"],
         shuffle=True,
-        num_workers=24,  # Set to 0 to avoid multiprocessing issues, or 2-4 for speed
+        num_workers=0, # JAX/Torch multiprocessing conflict avoidance
         collate_fn=numpy_collate,
         drop_last=False,
     )
@@ -404,7 +449,9 @@ def test(models, test_data):
         # batch = next(iter(test_loader))
 
         Xs, Ys = batch["x"], batch["y"]
-        Ys_hat = model(Xs, key=key)
+        
+        # WARP requires vmap over batch dimension
+        Ys_hat = jax.vmap(model)(Xs)
 
         last_Y = Ys[:, -1, :]  # Shape (batch_size, 1)
         last_Y_hat = Ys_hat[:, -1, :]  # Shape (batch_size, 1)
@@ -434,7 +481,8 @@ def test(models, test_data):
             Ys = jnp.concatenate([first_val, Ys_diff], axis=1)
 
         # Ys_hat = model(Xs, key=key)
-        Ys_hat = model.predict(Xs, key=key)
+        # We need to manually vectorise the predict method since it's an instance method
+        Ys_hat = jax.vmap(model.predict)(Xs)
 
         last_Y = Ys[:, -1, :]       # Shape (batch_size, 1)
         last_Y_hat = Ys_hat[:, -1, :]
